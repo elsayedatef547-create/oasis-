@@ -1,0 +1,91 @@
+# GitHub Actions: بناء InvoiceScanner (OASIS) كملف IPA غير موقّع (للتثبيت عبر AltStore / Sideloadly / TrollStore)
+# ضع الملف في:  .github/workflows/build.yaml
+# التشغيل: يدويًا من تبويب Actions (Run workflow) أو تلقائيًا عند أي push على main/master.
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Xcode info
+        run: |
+          xcode-select -p
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i ios || true
+
+      - name: Ensure iOS platform is installed
+        run: |
+          xcodebuild -downloadPlatform iOS || echo "downloadPlatform skipped/failed (may already be installed)"
+
+      - name: Locate project (project.yml)
+        run: |
+          YML=$(find . -name project.yml -not -path "*/build/*" -not -path "*/.git/*" | head -1)
+          if [ -z "$YML" ]; then echo "project.yml not found"; exit 1; fi
+          echo "PROJECT_DIR=$(dirname "$YML")" >> "$GITHUB_ENV"
+          echo "Project dir: $(dirname "$YML")"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: xcodegen generate
+
+      - name: Resolve Swift packages (CoreXLSX)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: xcodebuild -resolvePackageDependencies -project InvoiceScanner.xcodeproj -scheme InvoiceScanner
+
+      - name: Build (unsigned, Release, device SDK)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project InvoiceScanner.xcodeproj \
+            -scheme InvoiceScanner \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            | tee build.log | (xcpretty 2>/dev/null || cat)
+
+      - name: Package IPA
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          if [ -z "$APP" ]; then echo "No .app produced"; exit 1; fi
+          rm -rf Payload InvoiceScanner.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry InvoiceScanner.ipa Payload
+          ls -lh InvoiceScanner.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: InvoiceScanner-ipa
+          path: ${{ env.PROJECT_DIR }}/InvoiceScanner.ipa
+          if-no-files-found: error
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ env.PROJECT_DIR }}/build.log
+          if-no-files-found: ignore
